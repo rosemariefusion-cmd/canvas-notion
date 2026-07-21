@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
 """
 canvas_to_notion.py
-Sync upcoming Canvas assignments into a Notion database.
+Sync upcoming Canvas assignments into Notion, linked to a Courses database.
 
-This is a one-shot, idempotent sync (an "upsert"): run it as often as you
-like and it will create rows for new assignments and update existing ones
-in place, never duplicating. Schedule it with cron or GitHub Actions to keep
-Notion current automatically.
+For each active Canvas course it upserts a page in the Courses database, then
+for each upcoming assignment it upserts a row in the Canvas Assignments
+database and links it (via the "Course" relation) to its course page. Both
+upserts are idempotent, matched on Canvas IDs, so re-runs never duplicate.
 
 Required environment variables:
-  CANVAS_BASE_URL      e.g. https://canvas.yourschool.edu   (no trailing slash)
-  CANVAS_TOKEN         Canvas API access token
-  NOTION_TOKEN         Notion internal integration secret
-  NOTION_DATABASE_ID   Notion database ID (32 hex chars, from the DB page URL)
+  CANVAS_BASE_URL             e.g. https://canvas.yourschool.edu  (no trailing slash)
+  CANVAS_TOKEN                Canvas API access token
+  NOTION_TOKEN                Notion internal integration secret
+  NOTION_DATABASE_ID          Canvas Assignments database ID
+  NOTION_COURSES_DATABASE_ID  Courses database ID
 
 Optional:
-  NOTION_DATA_SOURCE_ID  Use this data source directly, skipping auto-resolution
-  DAYS_AHEAD             How many days of upcoming items to sync (default 60)
+  DAYS_AHEAD                  How many days of upcoming items to sync (default 60)
 """
 
 import os
@@ -30,21 +30,24 @@ CANVAS_BASE_URL = os.environ.get("CANVAS_BASE_URL", "").rstrip("/")
 CANVAS_TOKEN = os.environ.get("CANVAS_TOKEN", "")
 NOTION_TOKEN = os.environ.get("NOTION_TOKEN", "")
 NOTION_DATABASE_ID = os.environ.get("NOTION_DATABASE_ID", "")
-NOTION_DATA_SOURCE_ID = os.environ.get("NOTION_DATA_SOURCE_ID", "")
+NOTION_COURSES_DATABASE_ID = os.environ.get("NOTION_COURSES_DATABASE_ID", "")
 DAYS_AHEAD = int(os.environ.get("DAYS_AHEAD", "60"))
 
-NOTION_VERSION = "2026-03-11"        # current Notion API version (data-sources era)
+NOTION_VERSION = "2026-03-11"
 NOTION_API = "https://api.notion.com/v1"
 
-# Notion property names -- these MUST match your database columns exactly
-# (case-sensitive). If you rename a column in Notion, change it here too.
+# Canvas Assignments column names (case-sensitive, must match the database)
 PROP_TITLE = "Name"
-PROP_COURSE = "Course"
+PROP_COURSE = "Course"          # relation -> Courses database
 PROP_DUE = "Due"
 PROP_TYPE = "Type"
 PROP_URL = "Canvas URL"
 PROP_CANVAS_ID = "Canvas ID"
 PROP_DONE = "Done"
+
+# Courses column names
+COURSE_TITLE = "Name"
+COURSE_CANVAS_ID = "Canvas Course ID"
 
 TYPE_LABELS = {
     "assignment": "Assignment",
@@ -61,6 +64,7 @@ def require_env():
         "CANVAS_TOKEN": CANVAS_TOKEN,
         "NOTION_TOKEN": NOTION_TOKEN,
         "NOTION_DATABASE_ID": NOTION_DATABASE_ID,
+        "NOTION_COURSES_DATABASE_ID": NOTION_COURSES_DATABASE_ID,
     }.items() if not v]
     if missing:
         sys.exit(f"Missing required env vars: {', '.join(missing)}")
@@ -79,7 +83,6 @@ def canvas_get(path, params=None):
         r.raise_for_status()
         data = r.json()
         results.extend(data if isinstance(data, list) else [data])
-        # Canvas paginates via the Link header; follow rel="next" if present.
         url, params = None, None
         for part in r.headers.get("Link", "").split(","):
             seg = part.split(";")
@@ -140,7 +143,7 @@ def notion_request(method, path, **kwargs):
     url = f"{NOTION_API}/{path.lstrip('/')}"
     for _ in range(5):
         r = requests.request(method, url, headers=notion_headers(), timeout=30, **kwargs)
-        if r.status_code == 429:                       # rate limited -> back off
+        if r.status_code == 429:
             time.sleep(float(r.headers.get("Retry-After", "1")))
             continue
         if not r.ok:
@@ -149,42 +152,76 @@ def notion_request(method, path, **kwargs):
     sys.exit(f"Notion {method} {path} kept getting rate limited.")
 
 
-def resolve_data_source_id():
-    """A Notion database is a container for one or more data sources; the API
-    reads/writes rows at the data-source level. Auto-resolve it from the DB ID."""
-    if NOTION_DATA_SOURCE_ID:
-        return NOTION_DATA_SOURCE_ID
-    db = notion_request("GET", f"databases/{NOTION_DATABASE_ID}")
+def resolve_data_source_id(database_id):
+    """A Notion database contains one or more data sources; rows live at the
+    data-source level. Resolve it from the database ID."""
+    db = notion_request("GET", f"databases/{database_id}")
     sources = db.get("data_sources", [])
     if not sources:
-        sys.exit("No data sources on that database. Set NOTION_DATA_SOURCE_ID manually.")
+        sys.exit(f"No data sources found on database {database_id}.")
     return sources[0]["id"]
 
 
-def fetch_existing(ds_id):
-    """Return {canvas_id: notion_page_id} for rows already in the database."""
-    existing, cursor = {}, None
+def query_all(ds_id):
+    """Return every page in a data source (following pagination)."""
+    results, cursor = [], None
     while True:
         body = {"page_size": 100}
         if cursor:
             body["start_cursor"] = cursor
         data = notion_request("POST", f"data_sources/{ds_id}/query", json=body)
-        for page in data.get("results", []):
-            rt = page.get("properties", {}).get(PROP_CANVAS_ID, {}).get("rich_text", [])
-            cid = rt[0].get("plain_text", "").strip() if rt else ""
-            if cid:
-                existing[cid] = page["id"]
+        results.extend(data.get("results", []))
         if not data.get("has_more"):
             break
         cursor = data.get("next_cursor")
+    return results
+
+
+def _rich_text_value(page, prop_name):
+    rt = page.get("properties", {}).get(prop_name, {}).get("rich_text", [])
+    return rt[0].get("plain_text", "").strip() if rt else ""
+
+
+def upsert_courses(courses_ds_id, course_names):
+    """Ensure a page exists in Courses for each active course. Returns
+    {canvas_course_id: notion_page_id}."""
+    existing = {}
+    for page in query_all(courses_ds_id):
+        cid = _rich_text_value(page, COURSE_CANVAS_ID)
+        if cid:
+            existing[cid] = page["id"]
+
+    course_pages = {}
+    for course_id, name in course_names.items():
+        key = str(course_id)
+        if key in existing:
+            course_pages[course_id] = existing[key]
+        else:
+            res = notion_request("POST", "pages", json={
+                "parent": {"type": "data_source_id", "data_source_id": courses_ds_id},
+                "properties": {
+                    COURSE_TITLE: {"title": [{"text": {"content": name[:2000]}}]},
+                    COURSE_CANVAS_ID: {"rich_text": [{"text": {"content": key}}]},
+                },
+            })
+            course_pages[course_id] = res["id"]
+            time.sleep(0.34)
+    return course_pages
+
+
+def fetch_existing_assignments(ds_id):
+    """Return {canvas_id: notion_page_id} for assignment rows already present."""
+    existing = {}
+    for page in query_all(ds_id):
+        cid = _rich_text_value(page, PROP_CANVAS_ID)
+        if cid:
+            existing[cid] = page["id"]
     return existing
 
 
-def build_properties(item, course_names):
-    course = course_names.get(item["course_id"], "") if item["course_id"] else ""
+def build_properties(item, course_pages):
     props = {
         PROP_TITLE: {"title": [{"text": {"content": item["title"]}}]},
-        PROP_COURSE: {"rich_text": [{"text": {"content": course[:2000]}}]},
         PROP_TYPE: {"select": {"name": TYPE_LABELS.get(item["type"], item["type"])}},
         PROP_CANVAS_ID: {"rich_text": [{"text": {"content": item["canvas_id"]}}]},
         PROP_DONE: {"checkbox": item["done"]},
@@ -192,6 +229,9 @@ def build_properties(item, course_names):
     }
     if item["url"]:
         props[PROP_URL] = {"url": item["url"]}
+    page_id = course_pages.get(item["course_id"])
+    if page_id:
+        props[PROP_COURSE] = {"relation": [{"id": page_id}]}
     return props
 
 
@@ -206,24 +246,30 @@ def main():
     items = get_upcoming_items()
     print(f"  {len(items)} items")
 
-    ds_id = resolve_data_source_id()
-    existing = fetch_existing(ds_id)
-    print(f"  {len(existing)} rows already in Notion")
+    assignments_ds = resolve_data_source_id(NOTION_DATABASE_ID)
+    courses_ds = resolve_data_source_id(NOTION_COURSES_DATABASE_ID)
+
+    print("Syncing course pages...")
+    course_pages = upsert_courses(courses_ds, course_names)
+    print(f"  {len(course_pages)} course pages ready")
+
+    existing = fetch_existing_assignments(assignments_ds)
+    print(f"  {len(existing)} assignments already in Notion")
 
     created = updated = 0
     for it in items:
-        props = build_properties(it, course_names)
+        props = build_properties(it, course_pages)
         page_id = existing.get(it["canvas_id"])
         if page_id:
             notion_request("PATCH", f"pages/{page_id}", json={"properties": props})
             updated += 1
         else:
             notion_request("POST", "pages", json={
-                "parent": {"type": "data_source_id", "data_source_id": ds_id},
+                "parent": {"type": "data_source_id", "data_source_id": assignments_ds},
                 "properties": props,
             })
             created += 1
-        time.sleep(0.34)   # stay under Notion's ~3 requests/second limit
+        time.sleep(0.34)
 
     print(f"Done. Created {created}, updated {updated}.")
 
