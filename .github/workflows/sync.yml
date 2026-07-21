@@ -25,3 +25,4 @@ jobs:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
           DAYS_AHEAD: "60"
+NOTION_COURSES_DATABASE_ID: ${{ secrets.NOTION_COURSES_DATABASE_ID }}
