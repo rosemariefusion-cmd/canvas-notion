@@ -1,0 +1,27 @@
+name: Sync Canvas to Notion
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"   # every 15 minutes (UTC). GitHub may delay scheduled runs under heavy load.
+  workflow_dispatch:          # manual "Run workflow" button for an instant sync
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"          # caches deps so each run starts fast
+
+      - run: pip install -r requirements.txt
+
+      - run: python canvas_to_notion.py
+        env:
+          CANVAS_BASE_URL: ${{ secrets.CANVAS_BASE_URL }}
+          CANVAS_TOKEN: ${{ secrets.CANVAS_TOKEN }}
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
+          DAYS_AHEAD: "60"
