@@ -32,6 +32,7 @@ NOTION_TOKEN = os.environ.get("NOTION_TOKEN", "")
 NOTION_DATABASE_ID = os.environ.get("NOTION_DATABASE_ID", "")
 NOTION_COURSES_DATABASE_ID = os.environ.get("NOTION_COURSES_DATABASE_ID", "")
 DAYS_AHEAD = int(os.environ.get("DAYS_AHEAD", "60"))
+DAYS_BEHIND = int(os.environ.get("DAYS_BEHIND", "21"))
 
 NOTION_VERSION = "2026-03-11"
 NOTION_API = "https://api.notion.com/v1"
@@ -97,8 +98,11 @@ def get_course_names():
 
 
 def get_upcoming_items():
-    start = datetime.now(timezone.utc)
-    end = start + timedelta(days=DAYS_AHEAD)
+    # Look a bit into the past too (DAYS_BEHIND), not just forward — otherwise
+    # anything already overdue silently falls outside the search window and
+    # never gets pulled in at all.
+    start = datetime.now(timezone.utc) - timedelta(days=DAYS_BEHIND)
+    end = datetime.now(timezone.utc) + timedelta(days=DAYS_AHEAD)
     items = canvas_get("planner/items", {
         "start_date": start.isoformat(),
         "end_date": end.isoformat(),
@@ -127,7 +131,35 @@ def get_upcoming_items():
             "url": html_url,
             "done": bool(subs.get("submitted")) if isinstance(subs, dict) else False,
         }
-    return list(out.values())
+    return out
+
+
+def get_missing_submissions():
+    """Canvas's dedicated 'what have I missed' endpoint. Belt-and-suspenders
+    against the planner window ever excluding something overdue — this pulls
+    truly missing work regardless of how old it is."""
+    items = canvas_get("users/self/missing_submissions", {
+        "include[]": "planner_overrides",
+        "filter[]": "submittable",
+    })
+    out = {}
+    for a in items:
+        canvas_id = str(a.get("id", ""))
+        if not canvas_id:
+            continue
+        html_url = a.get("html_url", "")
+        if html_url.startswith("/"):
+            html_url = CANVAS_BASE_URL + html_url
+        out[canvas_id] = {
+            "canvas_id": canvas_id,
+            "title": (a.get("name") or "(untitled)")[:2000],
+            "course_id": a.get("course_id"),
+            "due": a.get("due_at"),
+            "type": "assignment",
+            "url": html_url,
+            "done": False,   # by definition: Canvas only lists it here if it's missing
+        }
+    return out
 
 
 # ---------- Notion ----------
@@ -242,9 +274,19 @@ def main():
     course_names = get_course_names()
     print(f"  {len(course_names)} courses")
 
-    print(f"Fetching Canvas items due in the next {DAYS_AHEAD} days...")
-    items = get_upcoming_items()
-    print(f"  {len(items)} items")
+    print(f"Fetching Canvas items from {DAYS_BEHIND} days ago through {DAYS_AHEAD} days ahead...")
+    items_by_id = get_upcoming_items()
+    print(f"  {len(items_by_id)} items")
+
+    print("Fetching missing submissions...")
+    missing_by_id = get_missing_submissions()
+    print(f"  {len(missing_by_id)} missing")
+
+    # Merge: missing_submissions is the source of truth for "this is actually
+    # missing" (it wins), everything else comes from the planner window.
+    items_by_id.update(missing_by_id)
+    items = list(items_by_id.values())
+    print(f"  {len(items)} total after merge")
 
     assignments_ds = resolve_data_source_id(NOTION_DATABASE_ID)
     courses_ds = resolve_data_source_id(NOTION_COURSES_DATABASE_ID)
