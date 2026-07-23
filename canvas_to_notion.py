@@ -56,6 +56,7 @@ TYPE_LABELS = {
     "discussion_topic": "Discussion",
     "wiki_page": "Page",
     "sub_assignment": "Assignment",
+    "missing": "Missing",
 }
 
 
@@ -155,7 +156,7 @@ def get_missing_submissions():
             "title": (a.get("name") or "(untitled)")[:2000],
             "course_id": a.get("course_id"),
             "due": a.get("due_at"),
-            "type": "assignment",
+            "type": "missing",
             "url": html_url,
             "done": False,   # by definition: Canvas only lists it here if it's missing
         }
@@ -242,23 +243,26 @@ def upsert_courses(courses_ds_id, course_names):
 
 
 def fetch_existing_assignments(ds_id):
-    """Return {canvas_id: notion_page_id} for assignment rows already present."""
+    """Return {canvas_id: (notion_page_id, currently_complete)} for rows
+    already present, so the caller can avoid ever unchecking Complete."""
     existing = {}
     for page in query_all(ds_id):
         cid = _rich_text_value(page, PROP_CANVAS_ID)
         if cid:
-            existing[cid] = page["id"]
+            is_complete = page.get("properties", {}).get(PROP_DONE, {}).get("checkbox", False)
+            existing[cid] = (page["id"], bool(is_complete))
     return existing
 
 
-def build_properties(item, course_pages):
+def build_properties(item, course_pages, include_done=True):
     props = {
         PROP_TITLE: {"title": [{"text": {"content": item["title"]}}]},
         PROP_TYPE: {"select": {"name": TYPE_LABELS.get(item["type"], item["type"])}},
         PROP_CANVAS_ID: {"rich_text": [{"text": {"content": item["canvas_id"]}}]},
-        PROP_DONE: {"checkbox": item["done"]},
         PROP_DUE: {"date": {"start": item["due"]} if item["due"] else None},
     }
+    if include_done:
+        props[PROP_DONE] = {"checkbox": item["done"]}
     if item["url"]:
         props[PROP_URL] = {"url": item["url"]}
     page_id = course_pages.get(item["course_id"])
@@ -300,12 +304,17 @@ def main():
 
     created = updated = 0
     for it in items:
-        props = build_properties(it, course_pages)
-        page_id = existing.get(it["canvas_id"])
-        if page_id:
+        existing_entry = existing.get(it["canvas_id"])
+        if existing_entry:
+            page_id, currently_complete = existing_entry
+            # Never let a sync run un-check something already marked complete
+            # (by a manual click or a prior run) — only ever flip false->true.
+            include_done = not currently_complete
+            props = build_properties(it, course_pages, include_done=include_done)
             notion_request("PATCH", f"pages/{page_id}", json={"properties": props})
             updated += 1
         else:
+            props = build_properties(it, course_pages, include_done=True)
             notion_request("POST", "pages", json={
                 "parent": {"type": "data_source_id", "data_source_id": assignments_ds},
                 "properties": props,
