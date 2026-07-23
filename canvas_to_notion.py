@@ -43,7 +43,7 @@ PROP_DUE = "Due"
 PROP_TYPE = "Type"
 PROP_URL = "Canvas URL"
 PROP_CANVAS_ID = "Canvas ID"
-PROP_DONE = "Done"
+PROP_DONE = "Complete"
 
 # Courses column names
 COURSE_TITLE = "Name"
